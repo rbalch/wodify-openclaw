@@ -1,0 +1,50 @@
+{
+  "id": "wodify",
+  "name": "Wodify",
+  "description": "Book CrossFit classes on Wodify",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "gymSubdomain": {
+        "type": "string",
+        "description": "Wodify gym subdomain (e.g., 'delraybeach')"
+      },
+      "email": {
+        "type": "string",
+        "description": "Wodify account email"
+      },
+      "password": {
+        "type": "string",
+        "description": "Wodify account password"
+      },
+      "customerId": {
+        "type": "string",
+        "description": "Numeric gym/tenant ID (e.g., '11025')"
+      },
+      "locationId": {
+        "type": "integer",
+        "description": "Gym location ID"
+      },
+      "customerHex": {
+        "type": "string",
+        "description": "Hex gym identifier (from email lookup response)"
+      },
+      "membershipId": {
+        "type": "string",
+        "description": "Active membership plan ID (from Wodify account)"
+      }
+    },
+    "required": ["gymSubdomain", "email", "password", "customerId", "locationId", "customerHex", "membershipId"]
+  },
+  "uiHints": {
+    "gymSubdomain": { "label": "Gym Subdomain" },
+    "email": { "label": "Email" },
+    "password": { "label": "Password", "sensitive": true },
+    "customerId": { "label": "Customer ID (numeric)" },
+    "locationId": { "label": "Location ID" },
+    "customerHex": { "label": "Customer Hex" },
+    "membershipId": { "label": "Membership ID" }
+  }
+}
