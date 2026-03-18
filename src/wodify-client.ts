@@ -328,28 +328,10 @@ export class WodifyClient {
 
   async bookClassBySchedule(
     classId: string,
-    programId: string,
+    _programId: string,
   ): Promise<{ success: boolean; message: string }> {
-    // 1. Check access and get membership
-    const access = await this.getClassAccess(classId, programId);
-
-    if (access.ClassAccess.IsBlocked) {
-      return { success: false, message: `Blocked: ${access.ClassAccess.BlockedText}` };
-    }
-    if (!access.ClassAccess.CanReserve) {
-      if (access.ClassAccess.CanJoinWaitlist) {
-        return { success: false, message: 'Class is full. Waitlist available but not yet supported.' };
-      }
-      return { success: false, message: 'Cannot reserve this class' };
-    }
-
-    const memberships = access.MembershipsAvailable.List;
-    if (memberships.length === 0) {
-      return { success: false, message: 'No available memberships for this class' };
-    }
-
-    // 2. Book with first available membership
-    const membershipId = memberships[0].Id;
+    // Use configured membershipId directly — getClassAccess returns {} (known OutSystems issue)
+    const membershipId = this.config.membershipId;
     const result = await this.bookClass(classId, membershipId);
 
     return {

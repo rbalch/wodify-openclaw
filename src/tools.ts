@@ -2,6 +2,14 @@ import { Type } from '@sinclair/typebox';
 import { WodifyClient } from './wodify-client.js';
 import type { WodifyPluginConfig, ClassScheduleItem } from './types.js';
 
+// Plugin config injected by OpenClaw register(), falls back to env vars
+let pluginConfig: WodifyPluginConfig | null = null;
+
+export function setPluginConfig(config: WodifyPluginConfig): void {
+  pluginConfig = config;
+  client = null; // reset client when config changes
+}
+
 // Shared client instance — re-created if config changes
 let client: WodifyClient | null = null;
 
@@ -10,6 +18,10 @@ function getClient(config: WodifyPluginConfig): WodifyClient {
     client = new WodifyClient(config);
   }
   return client;
+}
+
+function resolveConfig(): WodifyPluginConfig {
+  return pluginConfig ?? getConfigFromEnv();
 }
 
 function formatClass(item: ClassScheduleItem): string {
@@ -60,7 +72,7 @@ export const getClassesTool = {
     params: { date?: string; program_filter?: string[] },
     _signal?: AbortSignal,
   ) {
-    const config = getConfigFromEnv();
+    const config = resolveConfig();
     const client = getClient(config);
 
     const date = params.date || getTomorrowDate();
@@ -107,7 +119,7 @@ export const bookClassTool = {
     params: { class_id: string; program_id?: string },
     _signal?: AbortSignal,
   ) {
-    const config = getConfigFromEnv();
+    const config = resolveConfig();
     const client = getClient(config);
 
     const programId = params.program_id || '119335';
@@ -145,7 +157,7 @@ export const checkAccessTool = {
     params: { class_id: string; program_id?: string },
     _signal?: AbortSignal,
   ) {
-    const config = getConfigFromEnv();
+    const config = resolveConfig();
     const client = getClient(config);
 
     const programId = params.program_id || '119335';
