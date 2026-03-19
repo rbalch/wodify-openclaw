@@ -12,35 +12,113 @@ Provides three agent tools:
 ### 1. Install
 
 ```bash
-# Development (symlink):
+npm install
+npm run build
+
+# Install into OpenClaw (symlink for development):
 openclaw hooks install --link /path/to/wodify-openclaw
 
-# Production:
+# Or copy for production:
 openclaw hooks install /path/to/wodify-openclaw
 ```
 
-### 2. Configure Environment
+### 2. Discover Your Config
 
-Create a `.env` file (gitignored) with your gym and account details:
+The discovery script automatically fetches all the Wodify-specific IDs you need. You only provide three things: your gym's subdomain, your email, and your password.
 
 ```bash
-WODIFY_GYM_SUBDOMAIN=<gym subdomain>       # e.g. "delraybeach"
-WODIFY_EMAIL=<wodify account email>
-WODIFY_PASSWORD=<wodify account password>
-WODIFY_CUSTOMER_ID=<numeric gym/tenant ID>  # from login response
-WODIFY_LOCATION_ID=<gym location ID>        # from browser DevTools
-WODIFY_CUSTOMER_HEX=<hex gym identifier>    # from email lookup response
-WODIFY_MEMBERSHIP_ID=<membership plan ID>   # from Wodify account
+npx tsx discover.ts
 ```
 
-**How to find these values:**
-- `WODIFY_GYM_SUBDOMAIN` — the subdomain in your Wodify URL (e.g. `delraybeach` from `delraybeach.wodify.com`)
-- `WODIFY_CUSTOMER_HEX` — run the email lookup endpoint with your email; the `Customer` field in the response is the hex value
-- `WODIFY_CUSTOMER_ID` — returned as `CustomerId` in the login response
-- `WODIFY_LOCATION_ID` — inspect any schedule request in browser DevTools; look for `LocationId` in `clientVariables`
-- `WODIFY_MEMBERSHIP_ID` — visible in the Wodify member portal under your plan details, or from the class access API response
+The script will:
+1. Resolve API version hashes from the live Wodify deployment (no hardcoded values)
+2. Look up your account via email → discovers `customerHex`
+3. Log in with a dummy customer ID → the server returns the real `customerId`
+4. Fetch the gym's layout data → discovers `locationId` (and handles multi-location gyms)
+5. Fetch tomorrow's class schedule, then check membership access → discovers `membershipId`
 
-### 3. Agent Config
+Example output:
+
+```
+wodify-openclaw config discovery
+────────────────────────────────────────
+
+0. Resolving API versions...
+   moduleVersion: {moduleVersion}
+
+1. Email lookup...
+   customerHex = {customerHex}
+
+2. Logging in...
+   Logged in as {name} (customerId={customerId})
+
+3. Fetching gym locations...
+   {gymName} (locationId={locationId})
+
+4. Fetching schedule for {date}...
+   Found 8 classes. Using: [{classId}] CrossFit
+
+5. Checking membership access...
+   Memberships found:
+     [{membershipId}] Unlimited CrossFit (unlimited)
+
+────────────────────────────────────────────────────────────
+RESULTS
+────────────────────────────────────────────────────────────
+
+.env:
+WODIFY_GYM_SUBDOMAIN={gymSubdomain}
+WODIFY_EMAIL={email}
+WODIFY_PASSWORD={password}
+WODIFY_CUSTOMER_HEX={customerHex}
+WODIFY_CUSTOMER_ID={customerId}
+WODIFY_LOCATION_ID={locationId}
+WODIFY_MEMBERSHIP_ID={membershipId}
+
+openclaw.json plugin config:
+{ ... }
+```
+
+If `membershipId` can't be discovered (the `getClassAccess` endpoint occasionally returns empty due to an OutSystems quirk), the script will tell you. In that case, book a class in your browser with DevTools open and grab `inputParameters.SelectedMembershipId` from the booking POST request. This is the only value that might need a manual lookup.
+
+### 3. Configure
+
+Copy the output into a `.env` file (gitignored) in the plugin directory:
+
+```bash
+WODIFY_GYM_SUBDOMAIN={gymSubdomain}
+WODIFY_EMAIL={email}
+WODIFY_PASSWORD={password}
+WODIFY_CUSTOMER_HEX={customerHex}
+WODIFY_CUSTOMER_ID={customerId}
+WODIFY_LOCATION_ID={locationId}
+WODIFY_MEMBERSHIP_ID={membershipId}
+```
+
+Or pass config directly via `openclaw.json` (takes precedence over env vars):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "wodify": {
+        "path": "/path/to/wodify-openclaw",
+        "config": {
+          "gymSubdomain": "{gymSubdomain}",
+          "email": "{email}",
+          "password": "{password}",
+          "customerHex": "{customerHex}",
+          "customerId": "{customerId}",
+          "locationId": "{locationId}",
+          "membershipId": "{membershipId}"
+        }
+      }
+    }
+  }
+}
+```
+
+### 4. Agent Config
 
 Add the wodify tools to an agent's allowlist in `openclaw.json`:
 
@@ -58,7 +136,7 @@ Add the wodify tools to an agent's allowlist in `openclaw.json`:
 }
 ```
 
-### 4. Cron (Optional)
+### 5. Cron (Optional)
 
 Auto-book tomorrow's class every evening:
 
@@ -103,7 +181,6 @@ The extension communicates with Wodify's OutSystems Reactive backend via JSON sc
 
 ## Known Limitations
 
-- API version hashes are hardcoded and will break when Wodify deploys updates
-- `getClassAccess` endpoint returns empty — membership ID must be configured manually
+- `getClassAccess` endpoint occasionally returns empty — membership ID may need to be found manually (one-time)
 - Waitlist joining is detected but not yet implemented
 - Session re-auth on expiration is not yet handled
