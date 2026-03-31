@@ -220,6 +220,20 @@ export interface WodifyClientVariables {
   IsWebIntegration: boolean;
 }
 
+// --- Version Hashes ---
+
+export interface VersionHashes {
+  moduleVersion: string;
+  schedule: string;
+  emailLookup: string;
+  login: string;
+  booking: string;
+  classAccess: string;
+  membershipInit: string;
+  membershipClass: string;
+  membershipPlans: string;
+}
+
 // --- Plugin Config ---
 
 export interface WodifyPluginConfig {
@@ -230,4 +244,5 @@ export interface WodifyPluginConfig {
   locationId: number;
   customerHex: string;
   membershipId: string;
+  versionHashes?: VersionHashes;
 }

@@ -6,23 +6,33 @@ import type {
   ClassScheduleResponse,
   EmailLookupResponse,
   LoginResponse,
+  MembershipInfo,
+  VersionHashes,
   WodifyClientVariables,
   WodifyPluginConfig,
   WodifySession,
 } from './types.js';
 
-// OutSystems deployment hashes — change when Wodify deploys updates.
-// TODO: implement auto-recovery when these go stale
+// Hardcoded fallback hashes — used when versionHashes is not in plugin config.
+// These go stale on every Wodify deploy; run discover.ts --install to update.
 const VERSION_INFO = {
-  schedule: { moduleVersion: 'H_wOuQ5lnJnuPk1WWtvFWw', apiVersion: 'Z++9XwHvg5pOrhQ+_6KNtg' },
-  emailLookup: { moduleVersion: 'H_wOuQ5lnJnuPk1WWtvFWw', apiVersion: 'LBUrrh0V8wO4elKxJpxLZg' },
-  login: { moduleVersion: 'H_wOuQ5lnJnuPk1WWtvFWw', apiVersion: '9FW7tgg7a4XhD3OqvbS6Yw' },
-  booking: { moduleVersion: 'H_wOuQ5lnJnuPk1WWtvFWw', apiVersion: 'owTw8hgF2OfByCflv9dUZQ' },
-  classAccess: { moduleVersion: 'H_wOuQ5lnJnuPk1WWtvFWw', apiVersion: 'owTw8hgF2OfByCflv9dUZQ' },
+  schedule: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'Z++9XwHvg5pOrhQ+_6KNtg' },
+  emailLookup: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'LBUrrh0V8wO4elKxJpxLZg' },
+  login: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: '9FW7tgg7a4XhD3OqvbS6Yw' },
+  booking: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'owTw8hgF2OfByCflv9dUZQ' },
+  classAccess: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: '1XPPu_ntXIVRvoWOsmkwLQ' },
 } as const;
 
 const VIEW_NAME = 'Main.Main';
 const APPLICATION_SOURCE_ID = 13;
+
+// Thrown when any API response signals an OutSystems deployment has changed hashes.
+export class WodifyVersionChangedError extends Error {
+  constructor() {
+    super('Wodify version changed — hashes are stale');
+    this.name = 'WodifyVersionChangedError';
+  }
+}
 
 export class WodifyClient {
   private baseUrl: string;
@@ -50,6 +60,32 @@ export class WodifyClient {
   private sessionInitialized = false;
 
   /**
+   * Returns the versionInfo for an endpoint, preferring config hashes over the hardcoded fallback.
+   */
+  private getVI(key: keyof typeof VERSION_INFO): { moduleVersion: string; apiVersion: string } {
+    const hashes = this.config.versionHashes;
+    if (hashes) {
+      return { moduleVersion: hashes.moduleVersion, apiVersion: hashes[key] };
+    }
+    return VERSION_INFO[key];
+  }
+
+  /**
+   * Returns hashes for MembershipType-screen endpoints (not in VERSION_INFO fallback).
+   * Requires versionHashes in config — throws if missing.
+   */
+  private getMembershipVI(key: 'membershipClass' | 'membershipInit' | 'membershipPlans'): {
+    moduleVersion: string;
+    apiVersion: string;
+  } {
+    const hashes = this.config.versionHashes;
+    if (!hashes) {
+      throw new Error(`${key} hash not in config — run discover.ts --install first`);
+    }
+    return { moduleVersion: hashes.moduleVersion, apiVersion: hashes[key] };
+  }
+
+  /**
    * Bootstrap an OutSystems session. The main page returns zero cookies,
    * so we generate osVisitor/osVisit UUIDs and make a throwaway POST to
    * a screenservices endpoint. The server responds with Set-Cookie headers
@@ -74,7 +110,7 @@ export class WodifyClient {
         Cookie: this.getCookieString(),
       },
       body: JSON.stringify({
-        versionInfo: VERSION_INFO.emailLookup,
+        versionInfo: this.getVI('emailLookup'),
         viewName: VIEW_NAME,
         inputParameters: { Request: { Email: '' } },
       }),
@@ -113,7 +149,17 @@ export class WodifyClient {
       throw new Error(`Wodify API error ${res.status}: ${text.slice(0, 200)}`);
     }
 
-    return (await res.json()) as T;
+    const data = (await res.json()) as T;
+
+    // Detect OutSystems deployment — hashes are stale
+    const vi = (data as Record<string, unknown>)?.versionInfo as
+      | { hasModuleVersionChanged?: boolean; hasApiVersionChanged?: boolean }
+      | undefined;
+    if (vi?.hasModuleVersionChanged || vi?.hasApiVersionChanged) {
+      throw new WodifyVersionChangedError();
+    }
+
+    return data;
   }
 
   private getCookieString(): string {
@@ -148,7 +194,7 @@ export class WodifyClient {
   }
 
   /**
-   * OutSystems clientVariables — sent with every screenData-based request.
+   * OutSystems clientVariables — sent with every screenData-based request on the Classes screen.
    * Without this, screenData endpoints crash with NullReferenceException.
    */
   private getClientVariables(): WodifyClientVariables {
@@ -164,6 +210,25 @@ export class WodifyClient {
     };
   }
 
+  /**
+   * clientVariables for the MembershipType screen (OnlineSalesPage_CW module).
+   * Completely different schema from the Classes screen — wrong schema → NullRef.
+   */
+  private getMembershipClientVariables(): Record<string, string> {
+    return {
+      PrefilledEmail: '',
+      LoggedIn_GlobalUserId: this.session.globalUserId,
+      LoggedIn_UserName: '',
+      BookedForListSerialized: '',
+      TokenForCreatePassword: '',
+      LoggedIn_UserId: this.session.userId,
+      LoggedIn_LeadId: '0',
+      LoggedIn_CustomerId: this.config.customerId,
+      OnlineMembershipSaleId: '0',
+      LoggedIn_Email: this.config.email,
+    };
+  }
+
   // --- Auth ---
 
   async login(): Promise<{ userId: string; customer: string; firstName: string }> {
@@ -171,7 +236,7 @@ export class WodifyClient {
     const lookupPath =
       '/OnlineSalesPage/screenservices/OnlineSalesPage/Common/UserInfo/ServiceAPIGetSignInGlobalUserNameByEmail';
     const lookupRes = await this.request<EmailLookupResponse>(lookupPath, {
-      versionInfo: VERSION_INFO.emailLookup,
+      versionInfo: this.getVI('emailLookup'),
       viewName: VIEW_NAME,
       inputParameters: {
         Request: { Email: this.config.email },
@@ -189,7 +254,7 @@ export class WodifyClient {
     // Step 2: Password authentication
     const loginPath = '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/ActionPrepare_LoginUser';
     const loginRes = await this.request<LoginResponse>(loginPath, {
-      versionInfo: VERSION_INFO.login,
+      versionInfo: this.getVI('login'),
       viewName: VIEW_NAME,
       inputParameters: {
         UserName: this.config.email,
@@ -247,7 +312,7 @@ export class WodifyClient {
     const path =
       '/OnlineSalesPage/screenservices/OnlineSalesPage/Screens/Classes/DataActionGetClassSchedule_InClasses';
     const res = await this.request<ClassScheduleResponse>(path, {
-      versionInfo: VERSION_INFO.schedule,
+      versionInfo: this.getVI('schedule'),
       viewName: VIEW_NAME,
       screenData: {
         variables: {
@@ -276,7 +341,7 @@ export class WodifyClient {
       '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGetClassAccess_InMembershipType';
 
     const res = await this.request<ClassAccessResponse>(path, {
-      versionInfo: VERSION_INFO.classAccess,
+      versionInfo: this.getVI('classAccess'),
       viewName: VIEW_NAME,
       screenData: {
         variables: {
@@ -298,6 +363,72 @@ export class WodifyClient {
     return res.data;
   }
 
+  /**
+   * Get available memberships for a class via the two-step OutSystems data action chain.
+   * Requires versionHashes.membershipClass in config.
+   *
+   * Step 1: DataActionGet_Class_InMembershipType — populates class screen variables
+   * Step 2: DataActionGetClassAccess_InMembershipType — returns MembershipsAvailable.List
+   *
+   * Cannot call step 2 cold — it reads class data from screen state set by step 1.
+   */
+  async getClassMemberships(classId: string, programId: string): Promise<MembershipInfo[]> {
+    await this.ensureAuthenticated();
+
+    const membershipCv = this.getMembershipClientVariables();
+    const baseScreenVars = {
+      FilterProgramId: programId,
+      LoggedIn_UserId: this.session.userId,
+      LoggedIn_GlobalUserId: this.session.globalUserId,
+      LoggedIn_Email: this.config.email,
+      Customer: this.session.customer,
+      LocationId: this.config.locationId,
+      ClassId: classId,
+      HasProgramAccess: true,
+      SelectedMembershipId: '0',
+      ReservationOpenDateTime: new Date().toISOString(),
+      BookWithNewMembershipClicked: false,
+      IsButtonLoading: false,
+      CustomerCountNoShowReservations: false,
+      ContractTerm: 'Contract',
+      ShowBookingList: true,
+      IsToViewPurchaseOnly: false,
+    };
+
+    // Step 1: Fetch class details — its output feeds into GetClassAccess
+    const step1Path =
+      '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGet_Class_InMembershipType';
+    const step1 = await this.request<{ data: unknown }>(step1Path, {
+      versionInfo: this.getMembershipVI('membershipClass'),
+      viewName: VIEW_NAME,
+      screenData: { variables: baseScreenVars },
+      clientVariables: membershipCv,
+    });
+
+    // Step 2: Merge class data into screen vars, then call GetClassAccess
+    const fullScreenVars = {
+      ...baseScreenVars,
+      Get_Class_InMembershipType: step1.data,
+      _classIdInDataFetchStatus: 1,
+      _locationIdInDataFetchStatus: 1,
+      _customerInDataFetchStatus: 1,
+      _showBookingListInDataFetchStatus: 1,
+      _isToViewPurchaseOnlyInDataFetchStatus: 1,
+      _hasProgramAccessInDataFetchStatus: 1,
+    };
+
+    const step2Path =
+      '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGetClassAccess_InMembershipType';
+    const step2 = await this.request<ClassAccessResponse>(step2Path, {
+      versionInfo: this.getVI('classAccess'),
+      viewName: VIEW_NAME,
+      screenData: { variables: fullScreenVars },
+      clientVariables: membershipCv,
+    });
+
+    return step2.data.MembershipsAvailable.List;
+  }
+
   // --- Booking ---
 
   async bookClass(classId: string, membershipId: string): Promise<BookClassResponse['data']> {
@@ -306,7 +437,7 @@ export class WodifyClient {
     const path =
       '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/ActionBookClassWithExistingMembership';
     const res = await this.request<BookClassResponse>(path, {
-      versionInfo: VERSION_INFO.booking,
+      versionInfo: this.getVI('booking'),
       viewName: VIEW_NAME,
       inputParameters: {
         Customer: this.session.customer,
@@ -340,5 +471,15 @@ export class WodifyClient {
         ? result.Error.ErrorMessage
         : result.InfoMessage || 'Successfully booked!',
     };
+  }
+
+  // --- Config helpers ---
+
+  getConfig(): WodifyPluginConfig {
+    return this.config;
+  }
+
+  updateConfig(updates: Partial<WodifyPluginConfig>): void {
+    this.config = { ...this.config, ...updates };
   }
 }

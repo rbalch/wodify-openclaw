@@ -1,4 +1,4 @@
-import { getClassesTool, bookClassTool, checkAccessTool, setPluginConfig } from './src/tools.js';
+import { getClassesTool, bookClassTool, checkAccessTool, refreshConfigTool, setPluginConfig } from './src/tools.js';
 import type { WodifyPluginConfig } from './src/types.js';
 
 interface OpenClawPluginApi {
@@ -15,4 +15,5 @@ export default function register(api: OpenClawPluginApi): void {
   api.registerTool(getClassesTool, { optional: true });
   api.registerTool(bookClassTool, { optional: true });
   api.registerTool(checkAccessTool, { optional: true });
+  api.registerTool(refreshConfigTool, { optional: true });
 }

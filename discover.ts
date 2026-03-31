@@ -3,13 +3,19 @@
  * discover.ts — interactive config discovery for wodify-openclaw.
  *
  * Run with: npx tsx discover.ts
+ *   → interactive: prompts for gym subdomain, email, password
+ *   → outputs discovered config values to console
  *
- * Asks for your gym subdomain, email, and password, then automatically
- * discovers all config values needed for .env or openclaw.json.
- * All API version hashes are resolved dynamically from the live deployment.
+ * Run with: npx tsx discover.ts --install
+ *   → also writes config directly to ~/.openclaw/openclaw.json
+ *   → first-time setup: run this once, never touch config again
  */
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { join } from 'path';
+
+const INSTALL_MODE = process.argv.includes('--install');
 
 // --- Prompt helpers ---
 
@@ -56,10 +62,19 @@ function promptWithDefault(question: string, defaultVal: string): Promise<string
   return prompt(display).then((v) => v || defaultVal);
 }
 
+// Load existing openclaw.json config for defaults
+function loadExistingWodifyConfig(): Record<string, unknown> {
+  const configPath = join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+  try {
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    return (raw?.plugins?.entries?.wodify?.config as Record<string, unknown>) ?? {};
+  } catch {
+    return {};
+  }
+}
+
 // --- Version resolution ---
 
-// Maps endpoint screenservices paths to the JS file that contains their apiVersion.
-// The JS files use callDataAction/callServerAction("Name", "screenservices/...", "apiVersion", ...)
 const ENDPOINT_SOURCES: Record<string, { script: string; pathFragment: string }> = {
   emailLookup: {
     script: 'OnlineSalesPage.Common.UserInfo.mvc',
@@ -81,27 +96,38 @@ const ENDPOINT_SOURCES: Record<string, { script: string; pathFragment: string }>
     script: 'OnlineSalesPage_CW.Classes.MembershipType.mvc',
     pathFragment: 'DataActionGetClassAccess_InMembershipType',
   },
+  booking: {
+    script: 'OnlineSalesPage_CW.Classes.MembershipType.mvc',
+    pathFragment: 'ActionBookClassWithExistingMembership',
+  },
+  membershipInit: {
+    script: 'OnlineSalesPage_CW.Classes.MembershipType.mvc',
+    pathFragment: 'DataActionGet_InitialData_InMembershipType',
+  },
+  membershipClass: {
+    script: 'OnlineSalesPage_CW.Classes.MembershipType.mvc',
+    pathFragment: 'DataActionGet_Class_InMembershipType',
+  },
+  membershipPlans: {
+    script: 'OnlineSalesPage_CW.Classes.MembershipType.mvc',
+    pathFragment: 'DataActionGet_ClassPlansAndPacks_InMembershipType',
+  },
 };
 
 async function resolveVersions(
   base: string,
 ): Promise<{ moduleVersion: string; apiVersions: Record<string, string> }> {
-  // 1. Get current moduleVersion
   const versionRes = await fetch(`${base}/OnlineSalesPage/moduleservices/moduleversioninfo`);
   const { versionToken } = (await versionRes.json()) as { versionToken: string };
 
-  // 2. Get script URL map from moduleinfo
   const infoRes = await fetch(`${base}/OnlineSalesPage/moduleservices/moduleinfo`);
   const { manifest } = (await infoRes.json()) as {
     manifest: { urlVersions: Record<string, string> };
   };
   const urlVersions = manifest.urlVersions;
 
-  // 3. For each endpoint, find its JS file and extract apiVersion
   const apiVersions: Record<string, string> = {};
-
   for (const [key, { script, pathFragment }] of Object.entries(ENDPOINT_SOURCES)) {
-    // Find the script URL by matching the name
     const scriptPath = Object.keys(urlVersions).find(
       (k) => k.includes(script) && k.endsWith('.js'),
     );
@@ -113,10 +139,8 @@ async function resolveVersions(
     const jsRes = await fetch(`${base}${scriptPath}`);
     const js = await jsRes.text();
 
-    // Pattern: callDataAction("...", "screenservices/.../PathFragment", "apiVersion", ...)
-    // or callServerAction with same pattern
     const escaped = pathFragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const match = js.match(new RegExp(`${escaped}[^"]*",\\s*"([A-Za-z0-9+/=_-]{10,})"`));
+    const match = js.match(new RegExp(`${escaped}[^"]*",\\s*"([A-Za-z0-9+=_-]{10,})"`));
     if (match) {
       apiVersions[key] = match[1];
     } else {
@@ -194,16 +218,25 @@ async function bootstrapSession(): Promise<void> {
 // --- Main ---
 
 console.log('\nwodify-openclaw config discovery\n' + '─'.repeat(40));
+if (INSTALL_MODE) {
+  console.log('Mode: --install (will write to ~/.openclaw/openclaw.json)\n');
+}
 
-const gymSubdomain = await promptWithDefault(
+const existing = loadExistingWodifyConfig();
+
+const gymSubdomainRaw = await promptWithDefault(
   'Gym subdomain (e.g. "delraybeach" from delraybeach.wodify.com)',
-  process.env.WODIFY_GYM_SUBDOMAIN ?? '',
+  (existing.gymSubdomain as string) ?? process.env.WODIFY_GYM_SUBDOMAIN ?? '',
 );
-const email = await promptWithDefault('Email', process.env.WODIFY_EMAIL ?? '');
+const gymSubdomain = gymSubdomainRaw.replace(/\.wodify\.com.*$/i, '');
+const email = await promptWithDefault(
+  'Email',
+  (existing.email as string) ?? process.env.WODIFY_EMAIL ?? '',
+);
 const password = await promptPassword(
-  `Password${process.env.WODIFY_PASSWORD ? ' [from env]' : ''}: `,
+  `Password${existing.password || process.env.WODIFY_PASSWORD ? ' [from config/env]' : ''}: `,
 );
-const resolvedPassword = password || process.env.WODIFY_PASSWORD || '';
+const resolvedPassword = password || (existing.password as string) || process.env.WODIFY_PASSWORD || '';
 
 if (!gymSubdomain || !email || !resolvedPassword) {
   console.error('\nGym subdomain, email, and password are all required.');
@@ -324,83 +357,151 @@ if (locations.length === 0) {
   }
 }
 
-// --- Step 4: Schedule + getClassAccess → membershipId ---
+// --- Step 4 & 5: Schedule + two-step membership chain → membershipId ---
 let membershipId = '';
 
 if (locationId) {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const date = tomorrow.toISOString().split('T')[0];
-
   const cv = { ...clientVariables, LocationId: locationId };
 
-  console.log(`\n4. Fetching schedule for ${date}...`);
-  const schedRes: any = await post(
-    '/OnlineSalesPage/screenservices/OnlineSalesPage/Screens/Classes/DataActionGetClassSchedule_InClasses',
-    {
-      versionInfo: ver('schedule'),
-      viewName: 'Main.Main',
-      screenData: {
-        variables: {
-          ProgramsList: { List: [] },
-          SelectedProgramList: { List: [] },
-          EmployeesList: { List: [] },
-          SelectedEmployeesList: { List: [], EmptyListItem: { Id: '0' } },
-          SelectedDate: date,
-          SelectedDate_WeekChange: date,
-          SelectedLocationId: locationId,
-          LocationId: locationId,
-        },
-      },
-      clientVariables: cv,
-    },
-  );
-
-  const classes: any[] = schedRes?.data?.ClassSchedule?.List ?? [];
-  if (classes.length === 0) {
-    console.log('   No classes found for tomorrow — try again when classes are scheduled.');
-  } else {
-    const first = classes[0];
-    const classId = String(first.Class.Id);
-    const programId = first.Program.Id;
-    console.log(`   Found ${classes.length} classes. Using: [${classId}] ${first.Class.Name}`);
-
-    console.log('\n5. Checking membership access...');
-    const accessRes: any = await post(
-      '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGetClassAccess_InMembershipType',
+  let classes: any[] = [];
+  let date = '';
+  console.log('\n4. Scanning upcoming schedule for classes...');
+  for (let daysAhead = 1; daysAhead <= 7; daysAhead++) {
+    const d = new Date();
+    d.setDate(d.getDate() + daysAhead);
+    date = d.toISOString().split('T')[0];
+    const schedRes: any = await post(
+      '/OnlineSalesPage/screenservices/OnlineSalesPage/Screens/Classes/DataActionGetClassSchedule_InClasses',
       {
-        versionInfo: ver('classAccess'),
+        versionInfo: ver('schedule'),
         viewName: 'Main.Main',
         screenData: {
           variables: {
-            LoggedIn_UserId: userId,
-            LoggedIn_GlobalUserId: globalUserId,
-            LoggedIn_Email: email,
-            Customer: customerHex,
+            ProgramsList: {
+              List: [
+                { Value: '119335', Label: '', IsSelect: true, ImageUrl: '' },
+                { Value: '119416', Label: '', IsSelect: true, ImageUrl: '' },
+                { Value: '134852', Label: '', IsSelect: true, ImageUrl: '' },
+              ],
+            },
+            SelectedProgramList: { List: [{ Id: '119335' }, { Id: '119416' }, { Id: '134852' }] },
+            EmployeesList: { List: [] },
+            SelectedEmployeesList: { List: [], EmptyListItem: { Id: '0' } },
+            SelectedDate: date,
+            SelectedDate_WeekChange: date,
+            SelectedLocationId: locationId,
             LocationId: locationId,
-            ClassId: classId,
-            HasProgramAccess: true,
-            SelectedMembershipId: '0',
-            ReservationOpenDateTime: new Date().toISOString(),
-            FilterProgramId: programId,
           },
         },
         clientVariables: cv,
       },
     );
+    classes = schedRes?.data?.ClassSchedule?.List ?? [];
+    if (classes.length > 0) {
+      console.log(`   Found ${classes.length} classes on ${date}.`);
+      break;
+    }
+    console.log(`   No classes on ${date}, trying next day...`);
+  }
 
-    const memberships: any[] = accessRes?.data?.MembershipsAvailable?.List ?? [];
-    if (memberships.length > 0) {
-      membershipId = memberships[0].Id;
-      console.log('   Memberships found:');
-      for (const m of memberships) {
-        console.log(`     [${m.Id}] ${m.Name}${m.IsUnlimited ? ' (unlimited)' : ''}`);
-      }
+  if (classes.length === 0) {
+    console.log('   No classes found in the next 7 days — try again when classes are scheduled.');
+  } else {
+    const first = classes[0];
+    const classId = String(first.Class.Id);
+    const programId = first.Program.Id;
+    console.log(`   Using: [${classId}] ${first.Class.Name} on ${date}`);
+
+    const membershipCv = {
+      PrefilledEmail: '',
+      LoggedIn_GlobalUserId: globalUserId,
+      LoggedIn_UserName: '',
+      BookedForListSerialized: '',
+      TokenForCreatePassword: '',
+      LoggedIn_UserId: userId,
+      LoggedIn_LeadId: '0',
+      LoggedIn_CustomerId: customerId,
+      OnlineMembershipSaleId: '0',
+      LoggedIn_Email: email,
+    };
+
+    const baseScreenVars: any = {
+      FilterProgramId: programId,
+      LoggedIn_UserId: userId,
+      LoggedIn_GlobalUserId: globalUserId,
+      LoggedIn_Email: email,
+      Customer: customerHex,
+      LocationId: locationId,
+      ClassId: classId,
+      HasProgramAccess: true,
+      SelectedMembershipId: '0',
+      ReservationOpenDateTime: new Date().toISOString(),
+      BookWithNewMembershipClicked: false,
+      IsButtonLoading: false,
+      CustomerCountNoShowReservations: false,
+      ContractTerm: 'Contract',
+      ShowBookingList: true,
+      IsToViewPurchaseOnly: false,
+    };
+
+    console.log('\n5. Fetching class data for MembershipType screen...');
+    const classInfoRes: any = await post(
+      '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGet_Class_InMembershipType',
+      {
+        versionInfo: ver('membershipClass'),
+        viewName: 'Main.Main',
+        screenData: { variables: baseScreenVars },
+        clientVariables: membershipCv,
+      },
+    );
+
+    if (classInfoRes?.exception) {
+      console.log(`   Get_Class error: ${classInfoRes.exception.message}`);
     } else {
-      console.log(
-        '   getClassAccess returned no memberships (known OutSystems quirk).\n' +
-          '   Fallback: book a class in browser DevTools → POST body → inputParameters.SelectedMembershipId',
+      console.log(`   Get_Class OK (${first.Class.Name})`);
+
+      const fullScreenVars = {
+        ...baseScreenVars,
+        Get_Class_InMembershipType: classInfoRes.data,
+        _classIdInDataFetchStatus: 1,
+        _locationIdInDataFetchStatus: 1,
+        _customerInDataFetchStatus: 1,
+        _showBookingListInDataFetchStatus: 1,
+        _isToViewPurchaseOnlyInDataFetchStatus: 1,
+        _hasProgramAccessInDataFetchStatus: 1,
+      };
+
+      console.log('   Fetching membership access...');
+      const accessRes: any = await post(
+        '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/DataActionGetClassAccess_InMembershipType',
+        {
+          versionInfo: ver('classAccess'),
+          viewName: 'Main.Main',
+          screenData: { variables: fullScreenVars },
+          clientVariables: membershipCv,
+        },
       );
+
+      if (accessRes?.exception) {
+        console.log(`   GetClassAccess error: ${accessRes.exception.message}`);
+        console.log('   Raw:', JSON.stringify(accessRes, null, 2));
+      } else {
+        const memberships = accessRes?.data?.MembershipsAvailable?.List ?? [];
+        if (memberships.length > 0) {
+          membershipId = memberships[0].Id;
+          console.log('   Memberships found:');
+          for (const m of memberships) {
+            console.log(
+              `     [${m.Id}] ${m.Name} (${m.AttendanceLimitationLabel})${m.IsAutoRenew ? ' [auto-renew]' : ''}`,
+            );
+          }
+        } else {
+          console.log(
+            '   No memberships in response:',
+            JSON.stringify(accessRes?.data, null, 2).slice(0, 500),
+          );
+        }
+      }
     }
   }
 }
@@ -410,38 +511,71 @@ console.log('\n' + '─'.repeat(60));
 console.log('RESULTS');
 console.log('─'.repeat(60));
 
-console.log('\n.env:');
-console.log(`WODIFY_GYM_SUBDOMAIN=${gymSubdomain}`);
-console.log(`WODIFY_EMAIL=${email}`);
-console.log(`WODIFY_PASSWORD=${resolvedPassword}`);
-console.log(`WODIFY_CUSTOMER_HEX=${customerHex}`);
-console.log(`WODIFY_CUSTOMER_ID=${customerId}`);
-if (locationId) {
-  console.log(`WODIFY_LOCATION_ID=${locationId}`);
-} else {
-  console.log(`  # WODIFY_LOCATION_ID — not discovered`);
-}
-if (membershipId) {
-  console.log(`WODIFY_MEMBERSHIP_ID=${membershipId}`);
-} else {
-  console.log(`  # WODIFY_MEMBERSHIP_ID — not discovered`);
-}
+const versionHashes = {
+  moduleVersion,
+  schedule: apiVersions.schedule ?? '',
+  emailLookup: apiVersions.emailLookup ?? '',
+  login: apiVersions.login ?? '',
+  booking: apiVersions.booking ?? '',
+  classAccess: apiVersions.classAccess ?? '',
+  membershipInit: apiVersions.membershipInit ?? '',
+  membershipClass: apiVersions.membershipClass ?? '',
+  membershipPlans: apiVersions.membershipPlans ?? '',
+};
+
+const discoveredConfig = {
+  gymSubdomain,
+  email,
+  password: resolvedPassword,
+  customerHex,
+  customerId,
+  locationId: locationId || '<not discovered>',
+  membershipId: membershipId || '<not discovered>',
+  versionHashes,
+};
 
 console.log('\nopenclaw.json plugin config:');
-console.log(
-  JSON.stringify(
-    {
-      gymSubdomain,
-      email,
-      password: resolvedPassword,
-      customerHex,
-      customerId,
-      locationId: locationId || '<not discovered>',
-      membershipId: membershipId || '<not discovered>',
-    },
-    null,
-    2,
-  ),
-);
+console.log(JSON.stringify(discoveredConfig, null, 2));
+
+// --- Write to ~/.openclaw/openclaw.json ---
+const openclawConfigPath = join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+
+if (INSTALL_MODE) {
+  // --install: write full config to openclaw.json
+  try {
+    let raw: any = {};
+    if (existsSync(openclawConfigPath)) {
+      raw = JSON.parse(readFileSync(openclawConfigPath, 'utf8'));
+    }
+
+    raw.plugins ??= {};
+    raw.plugins.entries ??= {};
+    raw.plugins.entries.wodify ??= {};
+    raw.plugins.entries.wodify.config = discoveredConfig;
+
+    writeFileSync(openclawConfigPath, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+    console.log(`\nWritten to ${openclawConfigPath}`);
+  } catch (e) {
+    console.error(`\nFailed to write to ${openclawConfigPath}: ${e}`);
+    console.log('Copy the config above manually.');
+  }
+} else {
+  // Default mode: update only versionHashes + membershipId if openclaw.json exists
+  try {
+    if (existsSync(openclawConfigPath)) {
+      const raw = JSON.parse(readFileSync(openclawConfigPath, 'utf8'));
+      const wc = raw?.plugins?.entries?.wodify?.config;
+      if (wc) {
+        wc.versionHashes = versionHashes;
+        if (membershipId) wc.membershipId = membershipId;
+        writeFileSync(openclawConfigPath, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+        console.log(`\nUpdated versionHashes${membershipId ? ' + membershipId' : ''} in ${openclawConfigPath}`);
+      }
+    }
+  } catch {
+    // Silently skip if config isn't accessible
+  }
+  console.log('\nTip: run with --install to write full config to openclaw.json on first setup.');
+}
 
 console.log('');

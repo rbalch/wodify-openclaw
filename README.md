@@ -36,6 +36,11 @@ The script will:
 3. Log in with a dummy customer ID → the server returns the real `customerId`
 4. Fetch the gym's layout data → discovers `locationId` (and handles multi-location gyms)
 5. Fetch tomorrow's class schedule, then check membership access → discovers `membershipId`
+6. **Auto-patch** `src/wodify-client.ts` with fresh API version hashes — no manual edits needed
+
+**Re-run discovery when:**
+- Bookings fail with "You do not have an active membership" — membership ID rotates monthly
+- API calls return unexpected errors — version hashes go stale after Wodify deploys an update
 
 Example output:
 

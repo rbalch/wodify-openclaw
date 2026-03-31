@@ -2,7 +2,7 @@
   "id": "wodify",
   "name": "Wodify",
   "description": "Book CrossFit classes on Wodify",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -33,7 +33,23 @@
       },
       "membershipId": {
         "type": "string",
-        "description": "Active membership plan ID (from Wodify account)"
+        "description": "Active membership plan ID — auto-refreshed monthly"
+      },
+      "versionHashes": {
+        "type": "object",
+        "description": "OutSystems deployment hashes — auto-refreshed on Wodify deploys",
+        "properties": {
+          "moduleVersion": { "type": "string" },
+          "schedule": { "type": "string" },
+          "emailLookup": { "type": "string" },
+          "login": { "type": "string" },
+          "booking": { "type": "string" },
+          "classAccess": { "type": "string" },
+          "membershipInit": { "type": "string" },
+          "membershipClass": { "type": "string" },
+          "membershipPlans": { "type": "string" }
+        },
+        "additionalProperties": false
       }
     },
     "required": ["gymSubdomain", "email", "password", "customerId", "locationId", "customerHex", "membershipId"]
@@ -45,6 +61,7 @@
     "customerId": { "label": "Customer ID (numeric)" },
     "locationId": { "label": "Location ID" },
     "customerHex": { "label": "Customer Hex" },
-    "membershipId": { "label": "Membership ID" }
+    "membershipId": { "label": "Membership ID" },
+    "versionHashes": { "label": "Version Hashes (auto-managed)" }
   }
 }

@@ -1,6 +1,13 @@
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { execSync } from 'child_process';
 import { Type } from '@sinclair/typebox';
-import { WodifyClient } from './wodify-client.js';
-import type { WodifyPluginConfig, ClassScheduleItem } from './types.js';
+import { WodifyClient, WodifyVersionChangedError } from './wodify-client.js';
+import { discoverMembershipId, discoverVersionHashes } from './discover-client.js';
+import type { WodifyPluginConfig, ClassScheduleItem, VersionHashes } from './types.js';
+
+// Cron job ID for the wodify-booker agent (stable, set at creation time)
+const CRON_JOB_ID = '1ca611cc-70d5-424b-874c-cd6fc3758956';
 
 // Plugin config injected by OpenClaw register(), falls back to env vars
 let pluginConfig: WodifyPluginConfig | null = null;
@@ -22,6 +29,34 @@ function getClient(config: WodifyPluginConfig): WodifyClient {
 
 function resolveConfig(): WodifyPluginConfig {
   return pluginConfig ?? getConfigFromEnv();
+}
+
+/**
+ * Write updates to ~/.openclaw/openclaw.json under plugins.entries.wodify.config.
+ * Silently no-ops if the file isn't accessible (env-var mode or file missing).
+ */
+function updateOpenClawConfig(updates: Partial<WodifyPluginConfig>): void {
+  const configPath = join(process.env.HOME ?? '', '.openclaw', 'openclaw.json');
+  try {
+    const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+    Object.assign(raw.plugins.entries.wodify.config, updates);
+    writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  } catch {
+    // Config file not accessible — in-memory update only
+  }
+}
+
+/** Apply a config update both to the file and the in-memory pluginConfig. Resets client. */
+function applyConfigUpdate(updates: Partial<WodifyPluginConfig>): void {
+  updateOpenClawConfig(updates);
+  if (pluginConfig) {
+    Object.assign(pluginConfig, updates);
+  }
+  client = null; // force fresh client with updated config
+}
+
+function isMembershipError(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('do not have an active membership');
 }
 
 function formatClass(item: ClassScheduleItem): string {
@@ -49,6 +84,26 @@ function formatClass(item: ClassScheduleItem): string {
     .join('\n');
 }
 
+async function doBooking(
+  config: WodifyPluginConfig,
+  params: { class_id: string; program_id?: string },
+) {
+  const c = getClient(config);
+  const programId = params.program_id || '119335';
+  const result = await c.bookClassBySchedule(params.class_id, programId);
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: result.success
+          ? `Booked class ${params.class_id}! ${result.message}`
+          : `Booking failed for class ${params.class_id}: ${result.message}`,
+      },
+    ],
+    details: result,
+  };
+}
+
 // --- Tool: get_classes ---
 
 export const getClassesTool = {
@@ -73,10 +128,10 @@ export const getClassesTool = {
     _signal?: AbortSignal,
   ) {
     const config = resolveConfig();
-    const client = getClient(config);
+    const c = getClient(config);
 
     const date = params.date || getTomorrowDate();
-    const classes = await client.getClasses(date, params.program_filter);
+    const classes = await c.getClasses(date, params.program_filter);
 
     if (classes.length === 0) {
       return {
@@ -103,7 +158,7 @@ export const bookClassTool = {
   name: 'wodify_book_class',
   label: 'Wodify Book Class',
   description:
-    'Book a specific class on Wodify. Requires the class ID (from get_classes) and the program ID. Handles login, membership lookup, and booking in one step.',
+    'Book a specific class on Wodify. Requires the class ID (from get_classes) and the program ID. Handles login, membership lookup, and booking in one step. Self-heals stale membershipId and version hashes automatically.',
   parameters: Type.Object({
     class_id: Type.String({
       description: 'The class ID to book (from the schedule results, e.g., "177315537").',
@@ -119,23 +174,50 @@ export const bookClassTool = {
     params: { class_id: string; program_id?: string },
     _signal?: AbortSignal,
   ) {
-    const config = resolveConfig();
-    const client = getClient(config);
+    let config = resolveConfig();
 
-    const programId = params.program_id || '119335';
-    const result = await client.bookClassBySchedule(params.class_id, programId);
+    try {
+      return await doBooking(config, params);
+    } catch (err) {
+      // --- Self-heal: membership ID rotated ---
+      if (isMembershipError(err)) {
+        const newId = await discoverMembershipId(config).catch(() => '');
 
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: result.success
-            ? `Booked class ${params.class_id}! ${result.message}`
-            : `Booking failed for class ${params.class_id}: ${result.message}`,
-        },
-      ],
-      details: result,
-    };
+        if (!newId) {
+          // Membership genuinely expired or account issue — disable cron and notify
+          try {
+            execSync(`openclaw cron disable ${CRON_JOB_ID}`);
+          } catch {
+            // Best-effort — cron disable failing shouldn't prevent the error message
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: '⚠️ Wodify booking failed: membership may have expired. Could not auto-recover a new membership ID. The booking cron has been disabled. Check your Wodify account and re-run `npx tsx discover.ts --install` when resolved.',
+              },
+            ],
+          };
+        }
+
+        config = { ...config, membershipId: newId };
+        applyConfigUpdate({ membershipId: newId });
+        return await doBooking(config, params); // single retry
+      }
+
+      // --- Self-heal: Wodify deployed new version hashes ---
+      if (err instanceof WodifyVersionChangedError) {
+        const hashes = await discoverVersionHashes(config.gymSubdomain).catch(() => null);
+
+        if (hashes) {
+          config = { ...config, versionHashes: hashes };
+          applyConfigUpdate({ versionHashes: hashes as unknown as VersionHashes });
+          return await doBooking(config, params); // single retry
+        }
+      }
+
+      throw err; // Unknown error — let it bubble to the agent
+    }
   },
 };
 
@@ -158,10 +240,10 @@ export const checkAccessTool = {
     _signal?: AbortSignal,
   ) {
     const config = resolveConfig();
-    const client = getClient(config);
+    const c = getClient(config);
 
     const programId = params.program_id || '119335';
-    const access = await client.getClassAccess(params.class_id, programId);
+    const access = await c.getClassAccess(params.class_id, programId);
 
     const memberships = access.MembershipsAvailable.List.map(
       (m) => `  - ${m.Name} (${m.Id}) — ${m.AttendanceLimitationLabel}`,
@@ -182,6 +264,68 @@ export const checkAccessTool = {
     return {
       content: [{ type: 'text' as const, text: lines.join('\n') }],
       details: access,
+    };
+  },
+};
+
+// --- Tool: refresh_config ---
+
+export const refreshConfigTool = {
+  name: 'wodify_refresh_config',
+  label: 'Wodify Refresh Config',
+  description:
+    'Proactively refresh Wodify config (version hashes + membership ID) from live Wodify data. Run on the 1st of the month to stay ahead of monthly membership rotation.',
+  parameters: Type.Object({}),
+  async execute(_toolCallId: string, _params: Record<never, never>, _signal?: AbortSignal) {
+    const config = resolveConfig();
+    const changes: string[] = [];
+
+    // Refresh version hashes first
+    let freshHashes: VersionHashes;
+    try {
+      freshHashes = await discoverVersionHashes(config.gymSubdomain);
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Failed to refresh version hashes: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+      };
+    }
+
+    if (!config.versionHashes || config.versionHashes.moduleVersion !== freshHashes.moduleVersion) {
+      applyConfigUpdate({ versionHashes: freshHashes });
+      changes.push(`versionHashes updated → moduleVersion: ${freshHashes.moduleVersion}`);
+    }
+
+    // Refresh membership ID using fresh hashes
+    const configWithHashes = { ...config, versionHashes: freshHashes };
+    let newMembershipId: string;
+    try {
+      newMembershipId = await discoverMembershipId(configWithHashes);
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `${changes.length ? changes.join('\n') + '\n' : ''}Failed to refresh membershipId: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+      };
+    }
+
+    if (newMembershipId && newMembershipId !== config.membershipId) {
+      applyConfigUpdate({ membershipId: newMembershipId });
+      changes.push(`membershipId: ${config.membershipId} → ${newMembershipId}`);
+    }
+
+    const summary =
+      changes.length > 0 ? `Config refreshed:\n${changes.join('\n')}` : 'Config is current — no changes needed.';
+
+    return {
+      content: [{ type: 'text' as const, text: summary }],
     };
   },
 };
