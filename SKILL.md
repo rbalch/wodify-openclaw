@@ -28,6 +28,10 @@ Check if a class can be reserved and list available memberships. Useful for debu
    - Match by time (`StartTime` = `08:30:00`)
    - Call `wodify_book_class` with the matched class ID
 
+## Error Handling
+
+**If any tool returns a ⚠️ failure message, you MUST relay it to the user verbatim.** Do not silently swallow errors or say "I'll try again later." The user needs to know the booking didn't happen so they can book manually.
+
 ## Notes
 
 - Class IDs change daily — always fetch the schedule first

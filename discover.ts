@@ -1,14 +1,21 @@
 #!/usr/bin/env npx tsx
 /**
- * discover.ts — interactive config discovery for wodify-openclaw.
+ * discover.ts — config discovery for wodify-openclaw.
  *
- * Run with: npx tsx discover.ts
- *   → interactive: prompts for gym subdomain, email, password
- *   → outputs discovered config values to console
+ * Interactive mode (default):
+ *   npx tsx discover.ts            # prompts for missing values, defaults from existing openclaw.json
+ *   npx tsx discover.ts --install  # writes results to ~/.openclaw/openclaw.json
  *
- * Run with: npx tsx discover.ts --install
- *   → also writes config directly to ~/.openclaw/openclaw.json
- *   → first-time setup: run this once, never touch config again
+ * Non-interactive mode (auto-detected when stdin is not a TTY, or with --non-interactive):
+ *   Reads gym/email/password from CLI flags, then ~/.openclaw/openclaw.json, then env vars.
+ *   Suitable for automation, cron, recovery flows.
+ *
+ * Flags:
+ *   --gym <subdomain>      Gym subdomain (e.g. "delraybeach")
+ *   --email <addr>         Wodify account email
+ *   --password <pw>        Wodify account password (prefer config/env over CLI for security)
+ *   --install              Write resolved values back to ~/.openclaw/openclaw.json
+ *   --non-interactive      Force non-interactive mode (default when stdin isn't a TTY)
  */
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
@@ -16,6 +23,20 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
 const INSTALL_MODE = process.argv.includes('--install');
+
+// Parse --key value flags
+function getFlag(name: string): string | undefined {
+  const idx = process.argv.indexOf(`--${name}`);
+  if (idx >= 0 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  return undefined;
+}
+
+const FLAG_GYM = getFlag('gym');
+const FLAG_EMAIL = getFlag('email');
+const FLAG_PASSWORD = getFlag('password');
+const FORCE_NON_INTERACTIVE = process.argv.includes('--non-interactive');
 
 // --- Prompt helpers ---
 
@@ -223,20 +244,27 @@ if (INSTALL_MODE) {
 }
 
 const existing = loadExistingWodifyConfig();
+const NON_INTERACTIVE = FORCE_NON_INTERACTIVE || !process.stdin.isTTY;
 
-const gymSubdomainRaw = await promptWithDefault(
-  'Gym subdomain (e.g. "delraybeach" from delraybeach.wodify.com)',
-  (existing.gymSubdomain as string) ?? process.env.WODIFY_GYM_SUBDOMAIN ?? '',
-);
+// Precedence: CLI flag → existing config → env var → empty
+const defaultGymSubdomain =
+  FLAG_GYM ?? (existing.gymSubdomain as string) ?? process.env.WODIFY_GYM_SUBDOMAIN ?? '';
+const defaultEmail = FLAG_EMAIL ?? (existing.email as string) ?? process.env.WODIFY_EMAIL ?? '';
+const defaultPassword =
+  FLAG_PASSWORD || (existing.password as string) || process.env.WODIFY_PASSWORD || '';
+
+const gymSubdomainRaw = NON_INTERACTIVE
+  ? defaultGymSubdomain
+  : await promptWithDefault(
+      'Gym subdomain (e.g. "delraybeach" from delraybeach.wodify.com)',
+      defaultGymSubdomain,
+    );
 const gymSubdomain = gymSubdomainRaw.replace(/\.wodify\.com.*$/i, '');
-const email = await promptWithDefault(
-  'Email',
-  (existing.email as string) ?? process.env.WODIFY_EMAIL ?? '',
-);
-const password = await promptPassword(
-  `Password${existing.password || process.env.WODIFY_PASSWORD ? ' [from config/env]' : ''}: `,
-);
-const resolvedPassword = password || (existing.password as string) || process.env.WODIFY_PASSWORD || '';
+const email = NON_INTERACTIVE ? defaultEmail : await promptWithDefault('Email', defaultEmail);
+const password = NON_INTERACTIVE
+  ? ''
+  : await promptPassword(`Password${defaultPassword ? ' [from config/env]' : ''}: `);
+const resolvedPassword = password || defaultPassword;
 
 if (!gymSubdomain || !email || !resolvedPassword) {
   console.error('\nGym subdomain, email, and password are all required.');
@@ -269,7 +297,12 @@ if (lookupRes?.data?.Response?.Error?.HasError) {
   process.exit(1);
 }
 
-let customerHex: string = lookupRes?.data?.Response?.Customer ?? '';
+// Wodify wrapped the response in `ResponseGetSignInGlobalUserNameByEmail` post-2026-05 deploy;
+// older deployments returned `Customer` directly under `Response`. Tolerate both.
+const lookupPayload =
+  lookupRes?.data?.Response?.ResponseGetSignInGlobalUserNameByEmail ??
+  lookupRes?.data?.Response;
+let customerHex: string = lookupPayload?.Customer ?? '';
 if (!customerHex) {
   console.error('   Could not retrieve customerHex — check gym subdomain and email.');
   process.exit(1);
@@ -511,17 +544,31 @@ console.log('\n' + '─'.repeat(60));
 console.log('RESULTS');
 console.log('─'.repeat(60));
 
+// Fall back to existing hashes when extraction failed (e.g., AWS WAF blocks the
+// MembershipType .js file with a CAPTCHA challenge so we can't read it). This keeps
+// previously-working hashes intact rather than zeroing them out on each refresh.
+const existingHashes = (existing.versionHashes as Record<string, string> | undefined) ?? {};
+function pickHash(key: string): string {
+  return apiVersions[key] || existingHashes[key] || '';
+}
 const versionHashes = {
   moduleVersion,
-  schedule: apiVersions.schedule ?? '',
-  emailLookup: apiVersions.emailLookup ?? '',
-  login: apiVersions.login ?? '',
-  booking: apiVersions.booking ?? '',
-  classAccess: apiVersions.classAccess ?? '',
-  membershipInit: apiVersions.membershipInit ?? '',
-  membershipClass: apiVersions.membershipClass ?? '',
-  membershipPlans: apiVersions.membershipPlans ?? '',
+  schedule: pickHash('schedule'),
+  emailLookup: pickHash('emailLookup'),
+  login: pickHash('login'),
+  booking: pickHash('booking'),
+  classAccess: pickHash('classAccess'),
+  membershipInit: pickHash('membershipInit'),
+  membershipClass: pickHash('membershipClass'),
+  membershipPlans: pickHash('membershipPlans'),
 };
+
+const fallbackHashes = Object.entries(versionHashes).filter(
+  ([k, v]) => k !== 'moduleVersion' && v && !apiVersions[k],
+);
+if (fallbackHashes.length > 0) {
+  console.log(`   Using existing hashes for: ${fallbackHashes.map(([k]) => k).join(', ')}`);
+}
 
 const discoveredConfig = {
   gymSubdomain,
@@ -529,8 +576,8 @@ const discoveredConfig = {
   password: resolvedPassword,
   customerHex,
   customerId,
-  locationId: locationId || '<not discovered>',
-  membershipId: membershipId || '<not discovered>',
+  locationId: locationId || (existing.locationId as number | string) || '<not discovered>',
+  membershipId: membershipId || (existing.membershipId as string) || '<not discovered>',
   versionHashes,
 };
 

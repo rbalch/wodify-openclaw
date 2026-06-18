@@ -2,8 +2,8 @@ import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { Type } from '@sinclair/typebox';
-import { WodifyClient, WodifyVersionChangedError } from './wodify-client.js';
-import { discoverMembershipId, discoverVersionHashes } from './discover-client.js';
+import { WodifyClient, WodifyDriftError } from './wodify-client.js';
+import { discoverConfig, discoverMembershipId, discoverVersionHashes } from './discover-client.js';
 import type { WodifyPluginConfig, ClassScheduleItem, VersionHashes } from './types.js';
 
 // Cron job ID for the wodify-booker agent (stable, set at creation time)
@@ -17,13 +17,13 @@ export function setPluginConfig(config: WodifyPluginConfig): void {
   client = null; // reset client when config changes
 }
 
-// Shared client instance — re-created if config changes
+// Client instance — fresh per tool invocation to avoid stale server-side sessions.
+// Wodify's OutSystems auth is server-side (cookies stay anonymous-looking), so there's
+// no way to detect expiry client-side. Cheapest fix: just re-login every time.
 let client: WodifyClient | null = null;
 
 function getClient(config: WodifyPluginConfig): WodifyClient {
-  if (!client) {
-    client = new WodifyClient(config);
-  }
+  client = new WodifyClient(config);
   return client;
 }
 
@@ -57,6 +57,25 @@ function applyConfigUpdate(updates: Partial<WodifyPluginConfig>): void {
 
 function isMembershipError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('do not have an active membership');
+}
+
+function isDriftError(err: unknown): err is WodifyDriftError {
+  return err instanceof WodifyDriftError;
+}
+
+/**
+ * Recover from a Wodify version drift by re-discovering hashes (and membershipId, since
+ * a deploy can rotate everything). Persists fresh values to openclaw.json.
+ * Returns the updated config so the caller can retry the failed call.
+ */
+async function recoverFromDrift(config: WodifyPluginConfig): Promise<WodifyPluginConfig> {
+  const { versionHashes, membershipId } = await discoverConfig(config);
+  const updates: Partial<WodifyPluginConfig> = { versionHashes };
+  if (membershipId && membershipId !== config.membershipId) {
+    updates.membershipId = membershipId;
+  }
+  applyConfigUpdate(updates);
+  return { ...config, ...updates };
 }
 
 function formatClass(item: ClassScheduleItem): string {
@@ -127,11 +146,36 @@ export const getClassesTool = {
     params: { date?: string; program_filter?: string[] },
     _signal?: AbortSignal,
   ) {
-    const config = resolveConfig();
-    const c = getClient(config);
-
+    let config = resolveConfig();
     const date = params.date || getTomorrowDate();
-    const classes = await c.getClasses(date, params.program_filter);
+
+    async function fetch(cfg: WodifyPluginConfig): Promise<ClassScheduleItem[]> {
+      return getClient(cfg).getClasses(date, params.program_filter);
+    }
+
+    let classes: ClassScheduleItem[];
+    try {
+      classes = await fetch(config);
+    } catch (err) {
+      if (isDriftError(err)) {
+        try {
+          config = await recoverFromDrift(config);
+          classes = await fetch(config);
+        } catch (retryErr) {
+          const msg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          return {
+            content: [{ type: 'text' as const, text: `⚠️ Failed to fetch classes for ${date}: drift recovery failed: ${msg}\n\nYou MUST report this failure to the user.` }],
+          };
+        }
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        const c = getClient(config);
+        const drift = c.hasVersionDrift ? '\n(Note: Wodify version drift detected — hashes may need refresh via wodify_refresh_config)' : '';
+        return {
+          content: [{ type: 'text' as const, text: `⚠️ Failed to fetch classes for ${date}: ${msg}${drift}\n\nYou MUST report this failure to the user.` }],
+        };
+      }
+    }
 
     if (classes.length === 0) {
       return {
@@ -158,7 +202,7 @@ export const bookClassTool = {
   name: 'wodify_book_class',
   label: 'Wodify Book Class',
   description:
-    'Book a specific class on Wodify. Requires the class ID (from get_classes) and the program ID. Handles login, membership lookup, and booking in one step. Self-heals stale membershipId and version hashes automatically.',
+    'Book a specific class on Wodify. Requires the class ID (from get_classes) and the program ID. Handles login, membership lookup, and booking in one step. Self-heals stale membershipId automatically.',
   parameters: Type.Object({
     class_id: Type.String({
       description: 'The class ID to book (from the schedule results, e.g., "177315537").',
@@ -176,9 +220,38 @@ export const bookClassTool = {
   ) {
     let config = resolveConfig();
 
+    let lastErr: unknown;
     try {
       return await doBooking(config, params);
     } catch (err) {
+      lastErr = err;
+    }
+
+    // --- Self-heal: Wodify deployed, version hashes are stale ---
+    if (isDriftError(lastErr)) {
+      try {
+        config = await recoverFromDrift(config);
+      } catch (recoverErr) {
+        const msg = recoverErr instanceof Error ? recoverErr.message : String(recoverErr);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `⚠️ Wodify version drift detected and auto-recovery failed: ${msg}\n\nYou MUST report this failure to the user.`,
+            },
+          ],
+        };
+      }
+      try {
+        return await doBooking(config, params);
+      } catch (retryErr) {
+        // Drift recovered but booking still failed — fall through to regular error reporting
+        lastErr = retryErr;
+      }
+    }
+
+    {
+      const err = lastErr;
       // --- Self-heal: membership ID rotated ---
       if (isMembershipError(err)) {
         const newId = await discoverMembershipId(config).catch(() => '');
@@ -194,7 +267,7 @@ export const bookClassTool = {
             content: [
               {
                 type: 'text' as const,
-                text: '⚠️ Wodify booking failed: membership may have expired. Could not auto-recover a new membership ID. The booking cron has been disabled. Check your Wodify account and re-run `npx tsx discover.ts --install` when resolved.',
+                text: '⚠️ Wodify booking failed: membership may have expired. Could not auto-recover a new membership ID. The booking cron has been disabled. Check your Wodify account and re-run `npx tsx discover.ts --install` when resolved.\n\nYou MUST report this failure to the user.',
               },
             ],
           };
@@ -202,21 +275,23 @@ export const bookClassTool = {
 
         config = { ...config, membershipId: newId };
         applyConfigUpdate({ membershipId: newId });
-        return await doBooking(config, params); // single retry
-      }
-
-      // --- Self-heal: Wodify deployed new version hashes ---
-      if (err instanceof WodifyVersionChangedError) {
-        const hashes = await discoverVersionHashes(config.gymSubdomain).catch(() => null);
-
-        if (hashes) {
-          config = { ...config, versionHashes: hashes };
-          applyConfigUpdate({ versionHashes: hashes as unknown as VersionHashes });
-          return await doBooking(config, params); // single retry
+        try {
+          return await doBooking(config, params);
+        } catch (retryErr) {
+          const msg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          return {
+            content: [{ type: 'text' as const, text: `⚠️ Wodify booking failed after membership refresh: ${msg}\n\nYou MUST report this failure to the user.` }],
+          };
         }
       }
 
-      throw err; // Unknown error — let it bubble to the agent
+      // Any other error — return it as a message, don't throw
+      const msg = err instanceof Error ? err.message : String(err);
+      const c = getClient(config);
+      const drift = c.hasVersionDrift ? '\n(Note: Wodify version drift detected — hashes may need refresh via wodify_refresh_config)' : '';
+      return {
+        content: [{ type: 'text' as const, text: `⚠️ Wodify booking failed: ${msg}${drift}\n\nYou MUST report this failure to the user.` }],
+      };
     }
   },
 };
@@ -280,10 +355,10 @@ export const refreshConfigTool = {
     const config = resolveConfig();
     const changes: string[] = [];
 
-    // Refresh version hashes first
+    // Refresh version hashes first (passing existing for WAF-walled endpoint fallback)
     let freshHashes: VersionHashes;
     try {
-      freshHashes = await discoverVersionHashes(config.gymSubdomain);
+      freshHashes = await discoverVersionHashes(config.gymSubdomain, config.versionHashes);
     } catch (err) {
       return {
         content: [

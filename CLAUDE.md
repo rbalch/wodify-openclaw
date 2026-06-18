@@ -2,9 +2,15 @@
 
 ## Project Overview
 
-OpenClaw extension that books CrossFit classes on Wodify via pure HTTP (no browser automation). Three tools: `wodify_get_classes`, `wodify_book_class`, `wodify_check_access`.
+OpenClaw extension that books CrossFit classes on Wodify via pure HTTP (no browser automation). Four tools: `wodify_get_classes`, `wodify_book_class`, `wodify_check_access`, `wodify_refresh_config`.
 
 Full end-to-end flow verified 2026-03-14: session bootstrap → login → schedule fetch → class booking. Successfully booked CrossFit 7:00 AM on 2026-03-16 twice via API — confirmed in Wodify account.
+
+## OpenClaw Plugin Manifest Requirements (2026.5.3+)
+
+`openclaw.plugin.json` MUST declare every registered tool name in `contracts.tools`. If you add a new tool, append its name there or the gateway silently drops the registration with a `plugin must declare contracts.tools` diagnostic. Run `openclaw plugins doctor` to verify.
+
+The agent's `tools.allow` allowlist in `~/.openclaw/openclaw.json` must list each tool name explicitly — `["wodify"]` (plugin id) is NOT a valid alias post-2026.5.3. Use the full names: `wodify_get_classes`, `wodify_book_class`, `wodify_check_access`, `wodify_refresh_config`.
 
 ## Architecture
 
@@ -29,22 +35,54 @@ Full end-to-end flow verified 2026-03-14: session bootstrap → login → schedu
 
 **Membership ID** auto-renews monthly and changes. Use `npx tsx discover.ts` to resolve the current value (see "Membership Discovery" below).
 
-## discover.ts — Config Discovery & Auto-Patching
+## discover.ts — Config Discovery
 
-Run `npx tsx discover.ts` to automatically discover all config values and patch `wodify-client.ts` with fresh API version hashes.
+Run `npx tsx discover.ts` to discover all config values and write them to `~/.openclaw/openclaw.json`.
 
-**What it does:**
+### Modes
+
+| Mode | When triggered | Behavior |
+|------|----------------|----------|
+| Interactive | stdin is a TTY | Prompts for gym subdomain, email, password (defaults from existing config / env) |
+| Non-interactive | `--non-interactive` flag, OR stdin is not a TTY | Skips prompts. Reads creds from CLI flags → existing `openclaw.json` → env vars |
+
+### CLI Flags
+
+```bash
+npx tsx discover.ts                                    # interactive
+npx tsx discover.ts --install                          # interactive + write to openclaw.json
+npx tsx discover.ts --non-interactive --install        # use creds already in openclaw.json
+npx tsx discover.ts --gym foo --email a@b --password p # explicit creds
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--gym <subdomain>` | Override gym subdomain (e.g. `delraybeach`) |
+| `--email <addr>` | Override Wodify account email |
+| `--password <pw>` | Override password (prefer config/env over CLI for security) |
+| `--install` | Write resolved values back to `~/.openclaw/openclaw.json` |
+| `--non-interactive` | Force non-interactive mode (auto-detected when stdin isn't a TTY) |
+
+Cred precedence (any mode): CLI flag → existing openclaw.json → env var.
+
+### What it does
+
 1. Resolves `moduleVersion` + per-endpoint `apiVersion` hashes from live Wodify deployment JS files
 2. Logs in and discovers `customerHex`, `customerId`, `locationId`
 3. Fetches schedule (scans up to 7 days ahead to find a day with classes)
-4. Discovers `membershipId` via the MembershipType screen data action chain (see below)
-5. Auto-patches `src/wodify-client.ts` `VERSION_INFO` with fresh hashes
-6. Outputs `.env` and `openclaw.json` config blocks
+4. Discovers `membershipId` via the MembershipType screen data action chain
+5. Outputs config block; with `--install`, writes it to `~/.openclaw/openclaw.json`
 
-**When to run:**
+### Resilience: WAF-walled hash extraction
+
+Wodify serves the `MembershipType.mvc.js` script behind an AWS WAF "Goku" CAPTCHA challenge — extraction will quietly fail for `booking`, `classAccess`, `membershipInit`, `membershipClass`, `membershipPlans`. discover.ts now **falls back to the existing config's hash** for any endpoint whose JS can't be read, rather than zeroing it out. The known-good hashes therefore survive a refresh that only resolves the unwalled endpoints (`emailLookup`, `login`, `schedule`).
+
+### When to run
+
 - When bookings fail with "You do not have an active membership" (membershipId rotated)
 - When API calls return unexpected errors (version hashes stale after Wodify deploy)
 - After any Wodify outage or deploy
+- **Most of the time you don't need to** — the plugin auto-recovers (see "Auto-Recovery" below)
 
 ### Membership Discovery — The Hard-Won Lesson (2026-03-26)
 
@@ -147,6 +185,10 @@ Schedule queries require `ProgramsList` and `SelectedProgramList` to contain act
 
 **Auto-patching:** `discover.ts` resolves these dynamically and patches `src/wodify-client.ts` `VERSION_INFO` automatically. The regex extracts apiVersion hashes from JS source — hashes are alphanumeric+`=_-` (no `/`), which distinguishes them from endpoint paths.
 
+### Email-lookup response shape (post-2026-05 deploy)
+
+Wodify wrapped the lookup payload under `Response.ResponseGetSignInGlobalUserNameByEmail` (was `Response.<fields>` directly). The client and discover.ts both tolerate the new and old shapes — if you see a `WodifyDriftError` on `emailLookup`, suspect a third shape change and inspect the raw response.
+
 ### MembershipType Screen Endpoints (all in `OnlineSalesPage_CW.Classes.MembershipType.mvc`)
 - `DataActionGet_InitialData_InMembershipType` — screen init (location details)
 - `DataActionGet_Class_InMembershipType` — class details (must call before GetClassAccess)
@@ -191,11 +233,25 @@ npx tsx test-book-7am.ts [YYYY-MM-DD]  # Book CrossFit 7AM (real booking!)
 - Single quotes, trailing commas, 100-char width, 2-space indent
 - Typebox for JSON Schema parameter definitions
 
+## Auto-Recovery (Drift Self-Healing)
+
+`WodifyClient` throws a typed `WodifyDriftError` (defined in `src/wodify-client.ts`) when a response shape doesn't match what cached version hashes expect (e.g. missing `Error` envelope, missing `ClassSchedule.List`). This is the agent-catchable signal the user asked for.
+
+`getClassesTool` and `bookClassTool` in `src/tools.ts` catch `WodifyDriftError` and call `recoverFromDrift(config)`, which:
+
+1. Calls `discoverConfig(config)` (uses creds already in openclaw.json — no prompts)
+2. Refreshes `versionHashes` (with WAF-walled-endpoint fallback) AND `membershipId`
+3. Persists updates to `~/.openclaw/openclaw.json` via `applyConfigUpdate`
+4. Retries the failed call once
+
+If recovery still fails, the tool returns a clear error message to the agent. The membership-rotation self-heal (existing logic for "do not have an active membership" errors) runs after the drift handler.
+
+**The agent does not need to manually call `wodify_refresh_config`** — it kicks in automatically. The proactive `wodify_refresh_config` tool is still there for monthly preemptive refresh.
+
 ## Open Items
 
-- **Auto-run discover.ts on booking failure** — when cron reports "no active membership", automatically re-discover membershipId and update config. Currently requires manual intervention.
 - **`check_access` tool in tools.ts still broken** — uses the old single-call approach to `GetClassAccess` which NullRefs. Should be updated to use the two-step chain from discover.ts.
-- **Version hash auto-recovery in wodify-client.ts** — could detect stale hashes at runtime and re-resolve via `/moduleservices/moduleversioninfo` instead of requiring discover.ts.
+- **MembershipType JS is WAF-walled** — `discover.ts` and `discoverVersionHashes` cannot extract `booking`/`classAccess`/`membership*` apiVersion hashes from `OnlineSalesPage_CW.Classes.MembershipType.mvc.js`; both fall back to the existing config's hashes. If Wodify rotates one of those, recovery will fail until the WAF wall is bypassed (browser automation, captcha solver, or a Wodify-supplied API).
 
 ## Reference
 

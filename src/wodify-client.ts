@@ -13,26 +13,48 @@ import type {
   WodifySession,
 } from './types.js';
 
+/**
+ * Thrown when Wodify's response shape is malformed in a way that indicates the
+ * cached version hashes (moduleVersion / per-endpoint apiVersion) are stale.
+ * Caller should refresh hashes via discoverConfig() and retry.
+ */
+export class WodifyDriftError extends Error {
+  readonly hint: string;
+  readonly endpoint: string;
+  constructor(endpoint: string, hint: string) {
+    super(`Wodify version drift on ${endpoint}: ${hint}`);
+    this.name = 'WodifyDriftError';
+    this.endpoint = endpoint;
+    this.hint = hint;
+  }
+}
+
+/** Reads `.Error` defensively. Throws WodifyDriftError if the field is missing. */
+function readError(
+  body: { Error?: { HasError?: boolean; ErrorMessage?: string } } | undefined,
+  endpoint: string,
+): { HasError: boolean; ErrorMessage?: string } {
+  if (!body || !body.Error || typeof body.Error.HasError !== 'boolean') {
+    throw new WodifyDriftError(
+      endpoint,
+      'response is missing the `Error` envelope — version hashes are likely stale',
+    );
+  }
+  return body.Error as { HasError: boolean; ErrorMessage?: string };
+}
+
 // Hardcoded fallback hashes — used when versionHashes is not in plugin config.
 // These go stale on every Wodify deploy; run discover.ts --install to update.
 const VERSION_INFO = {
-  schedule: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'Z++9XwHvg5pOrhQ+_6KNtg' },
-  emailLookup: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'LBUrrh0V8wO4elKxJpxLZg' },
-  login: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: '9FW7tgg7a4XhD3OqvbS6Yw' },
-  booking: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: 'owTw8hgF2OfByCflv9dUZQ' },
-  classAccess: { moduleVersion: 'emr19ZKQyvyQIKvA78aECQ', apiVersion: '1XPPu_ntXIVRvoWOsmkwLQ' },
+  schedule: { moduleVersion: '1BuJVGkuIdK2rrmcNZN5mA', apiVersion: 'Z++9XwHvg5pOrhQ+_6KNtg' },
+  emailLookup: { moduleVersion: '1BuJVGkuIdK2rrmcNZN5mA', apiVersion: 'm0MMhE78rlyNJazWXLZpKg' },
+  login: { moduleVersion: '1BuJVGkuIdK2rrmcNZN5mA', apiVersion: 'ZGa26PTySxkv1DvmjxEn_w' },
+  booking: { moduleVersion: '1BuJVGkuIdK2rrmcNZN5mA', apiVersion: 'owTw8hgF2OfByCflv9dUZQ' },
+  classAccess: { moduleVersion: '1BuJVGkuIdK2rrmcNZN5mA', apiVersion: '1XPPu_ntXIVRvoWOsmkwLQ' },
 } as const;
 
 const VIEW_NAME = 'Main.Main';
 const APPLICATION_SOURCE_ID = 13;
-
-// Thrown when any API response signals an OutSystems deployment has changed hashes.
-export class WodifyVersionChangedError extends Error {
-  constructor() {
-    super('Wodify version changed — hashes are stale');
-    this.name = 'WodifyVersionChangedError';
-  }
-}
 
 export class WodifyClient {
   private baseUrl: string;
@@ -57,6 +79,12 @@ export class WodifyClient {
     return this.session.authenticated;
   }
 
+  /** True if any response signaled a Wodify deployment changed version hashes. */
+  get hasVersionDrift(): boolean {
+    return this.versionDrifted;
+  }
+
+  private versionDrifted = false;
   private sessionInitialized = false;
 
   /**
@@ -99,67 +127,95 @@ export class WodifyClient {
 
     // Throwaway POST — the 403 response sets the CSRF cookies
     const url = `${this.baseUrl}/OnlineSalesPage/screenservices/OnlineSalesPage/Common/UserInfo/ServiceAPIGetSignInGlobalUserNameByEmail`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=UTF-8',
-        Accept: 'application/json',
-        Origin: this.baseUrl,
-        Referer: `${this.baseUrl}/OnlineSalesPage/Main`,
-        'x-csrftoken': 'bootstrap',
-        Cookie: this.getCookieString(),
-      },
-      body: JSON.stringify({
-        versionInfo: this.getVI('emailLookup'),
-        viewName: VIEW_NAME,
-        inputParameters: { Request: { Email: '' } },
-      }),
-    });
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+            Accept: 'application/json',
+            Origin: this.baseUrl,
+            Referer: `${this.baseUrl}/OnlineSalesPage/Main`,
+            'x-csrftoken': 'bootstrap',
+            Cookie: this.getCookieString(),
+          },
+          body: JSON.stringify({
+            versionInfo: this.getVI('emailLookup'),
+            viewName: VIEW_NAME,
+            inputParameters: { Request: { Email: '' } },
+          }),
+        });
 
-    this.extractCookies(res);
-    await res.text().catch(() => {}); // consume body
+        this.extractCookies(res);
+        await res.text().catch(() => {}); // consume body
 
-    this.sessionInitialized = true;
+        this.sessionInitialized = true;
+        return;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    throw lastError;
   }
 
   // --- HTTP Layer ---
 
-  private async request<T>(path: string, body: unknown): Promise<T> {
+  private async request<T>(path: string, body: unknown, retries = 2): Promise<T> {
     await this.initSession();
     const url = `${this.baseUrl}${path}`;
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=UTF-8',
-        Accept: 'application/json',
-        Origin: this.baseUrl,
-        Referer: `${this.baseUrl}/OnlineSalesPage/Main`,
-        'x-csrftoken': this.session.csrfToken,
-        Cookie: this.getCookieString(),
-      },
-      body: JSON.stringify(body),
-      redirect: 'manual',
-    });
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+            Accept: 'application/json',
+            Origin: this.baseUrl,
+            Referer: `${this.baseUrl}/OnlineSalesPage/Main`,
+            'x-csrftoken': this.session.csrfToken,
+            Cookie: this.getCookieString(),
+          },
+          body: JSON.stringify(body),
+          redirect: 'manual',
+        });
 
-    this.extractCookies(res);
+        this.extractCookies(res);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Wodify API error ${res.status}: ${text.slice(0, 200)}`);
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          throw new Error(`Wodify API error ${res.status}: ${text.slice(0, 200)}`);
+        }
+
+        const data = (await res.json()) as T;
+
+        // Log version drift — data is still valid, just note it for future hash refresh
+        const vi = (data as Record<string, unknown>)?.versionInfo as
+          | { hasModuleVersionChanged?: boolean; hasApiVersionChanged?: boolean }
+          | undefined;
+        if (vi?.hasModuleVersionChanged || vi?.hasApiVersionChanged) {
+          this.versionDrifted = true;
+          console.warn(`[wodify] version drift detected (module=${vi.hasModuleVersionChanged}, api=${vi.hasApiVersionChanged})`);
+        }
+
+        return data;
+      } catch (err) {
+        // Only retry network-level failures (fetch failed, DNS, TLS, timeout)
+        if (err instanceof Error && err.message.startsWith('Wodify API error')) {
+          throw err;
+        }
+        lastError = err;
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        }
+      }
     }
-
-    const data = (await res.json()) as T;
-
-    // Detect OutSystems deployment — hashes are stale
-    const vi = (data as Record<string, unknown>)?.versionInfo as
-      | { hasModuleVersionChanged?: boolean; hasApiVersionChanged?: boolean }
-      | undefined;
-    if (vi?.hasModuleVersionChanged || vi?.hasApiVersionChanged) {
-      throw new WodifyVersionChangedError();
-    }
-
-    return data;
+    throw lastError;
   }
 
   private getCookieString(): string {
@@ -243,13 +299,27 @@ export class WodifyClient {
       },
     });
 
-    const lookupData = lookupRes.data.Response;
-    if (lookupData.Error.HasError) {
-      throw new Error(`Email lookup failed: ${lookupData.Error.ErrorMessage}`);
+    // Wodify wrapped the lookup payload in `ResponseGetSignInGlobalUserNameByEmail` post-2026-05
+    // deploy; older deployments returned the fields directly under `Response`. Tolerate both.
+    const lookupResponse = lookupRes.data?.Response as
+      | (Record<string, unknown> & {
+          Customer?: string;
+          ResponseGetSignInGlobalUserNameByEmail?: { Customer?: string };
+          Error?: { HasError?: boolean; ErrorMessage?: string };
+        })
+      | undefined;
+    const lookupPayload =
+      lookupResponse?.ResponseGetSignInGlobalUserNameByEmail ?? lookupResponse;
+    const lookupErr = readError(lookupResponse, 'emailLookup');
+    if (lookupErr.HasError) {
+      throw new Error(`Email lookup failed: ${lookupErr.ErrorMessage}`);
+    }
+    if (!lookupPayload?.Customer) {
+      throw new WodifyDriftError('emailLookup', 'response missing Customer field');
     }
 
     // Store Customer hex from lookup (needed for clientVariables before login completes)
-    this.session.customer = lookupData.Customer;
+    this.session.customer = lookupPayload.Customer;
 
     // Step 2: Password authentication
     const loginPath = '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/ActionPrepare_LoginUser';
@@ -283,6 +353,8 @@ export class WodifyClient {
     this.session.customer = user.Customer;
     this.session.customerId = user.CustomerId;
     this.session.authenticated = true;
+
+    console.log(`[wodify] login OK: userId=${user.UserId} globalUserId=${user.GlobalUserId} customer=${user.Customer}`);
 
     return {
       userId: user.UserId,
@@ -329,7 +401,22 @@ export class WodifyClient {
       clientVariables: this.getClientVariables(),
     });
 
-    return res.data.ClassSchedule.List;
+    if (!res.data?.ClassSchedule?.List) {
+      throw new WodifyDriftError('schedule', 'response is missing ClassSchedule.List');
+    }
+    const list = res.data.ClassSchedule.List;
+    // An empty schedule while version drift is flagged is suspicious: Wodify deploys can
+    // transiently return an empty list inside a valid envelope (HTTP 200, no error). Treat it
+    // as drift so the tool layer re-discovers hashes and retries once, rather than silently
+    // reporting "No classes found" and giving up. If the day is genuinely empty, the retry runs
+    // with fresh (non-drifting) hashes and returns the empty list normally.
+    if (list.length === 0 && this.versionDrifted) {
+      throw new WodifyDriftError(
+        'schedule',
+        'schedule returned an empty list while version drift was detected — hashes are likely stale',
+      );
+    }
+    return list;
   }
 
   // --- Pre-Booking ---
@@ -436,6 +523,7 @@ export class WodifyClient {
 
     const path =
       '/OnlineSalesPage/screenservices/OnlineSalesPage_CW/Classes/MembershipType/ActionBookClassWithExistingMembership';
+    console.log(`[wodify] bookClass: classId=${classId} membershipId=${membershipId} userId=${this.session.userId} customer=${this.session.customer} authenticated=${this.session.authenticated}`);
     const res = await this.request<BookClassResponse>(path, {
       versionInfo: this.getVI('booking'),
       viewName: VIEW_NAME,
@@ -448,8 +536,11 @@ export class WodifyClient {
       },
     });
 
-    if (res.data.Error.HasError) {
-      throw new Error(`Booking failed: ${res.data.Error.ErrorMessage}`);
+    console.log(`[wodify] bookClass response: ${JSON.stringify(res.data)}`);
+
+    const bookingErr = readError(res.data, 'booking');
+    if (bookingErr.HasError) {
+      throw new Error(`Booking failed: ${bookingErr.ErrorMessage}`);
     }
 
     return res.data;

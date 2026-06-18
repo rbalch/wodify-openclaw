@@ -52,8 +52,15 @@ const ENDPOINT_SOURCES: Record<string, { script: string; pathFragment: string }>
 /**
  * Discover current OutSystems deployment version hashes.
  * Two unauthenticated GETs — no session needed.
+ *
+ * `existing` is the previous VersionHashes (typically from openclaw.json). When
+ * extraction fails for an endpoint (e.g. AWS WAF challenge on the JS file),
+ * we fall back to the existing value to avoid zeroing out a working hash.
  */
-export async function discoverVersionHashes(gymSubdomain: string): Promise<VersionHashes> {
+export async function discoverVersionHashes(
+  gymSubdomain: string,
+  existing?: VersionHashes,
+): Promise<VersionHashes> {
   const base = `https://${gymSubdomain}.wodify.com`;
 
   const versionRes = await fetch(`${base}/OnlineSalesPage/moduleservices/moduleversioninfo`);
@@ -90,16 +97,19 @@ export async function discoverVersionHashes(gymSubdomain: string): Promise<Versi
     }
   }
 
+  const pick = (key: keyof Omit<VersionHashes, 'moduleVersion'>) =>
+    apiVersions[key] || existing?.[key] || '';
+
   return {
     moduleVersion: versionToken,
-    schedule: apiVersions.schedule ?? '',
-    emailLookup: apiVersions.emailLookup ?? '',
-    login: apiVersions.login ?? '',
-    booking: apiVersions.booking ?? '',
-    classAccess: apiVersions.classAccess ?? '',
-    membershipInit: apiVersions.membershipInit ?? '',
-    membershipClass: apiVersions.membershipClass ?? '',
-    membershipPlans: apiVersions.membershipPlans ?? '',
+    schedule: pick('schedule'),
+    emailLookup: pick('emailLookup'),
+    login: pick('login'),
+    booking: pick('booking'),
+    classAccess: pick('classAccess'),
+    membershipInit: pick('membershipInit'),
+    membershipClass: pick('membershipClass'),
+    membershipPlans: pick('membershipPlans'),
   };
 }
 
@@ -115,8 +125,9 @@ export async function discoverVersionHashes(gymSubdomain: string): Promise<Versi
  * Returns '' if no membership found (expired / account issue).
  */
 export async function discoverMembershipId(config: WodifyPluginConfig): Promise<string> {
-  // Always use fresh hashes so membership discovery never fails on stale versions
-  const freshHashes = await discoverVersionHashes(config.gymSubdomain);
+  // Always use fresh hashes so membership discovery never fails on stale versions.
+  // Fall back to existing config hashes for endpoints whose JS is WAF-walled.
+  const freshHashes = await discoverVersionHashes(config.gymSubdomain, config.versionHashes);
   const configWithHashes: WodifyPluginConfig = { ...config, versionHashes: freshHashes };
   const client = new WodifyClient(configWithHashes);
 
@@ -162,7 +173,7 @@ export interface DiscoverResult {
  * Used by wodify_refresh_config and first-time onboarding.
  */
 export async function discoverConfig(config: WodifyPluginConfig): Promise<DiscoverResult> {
-  const versionHashes = await discoverVersionHashes(config.gymSubdomain);
+  const versionHashes = await discoverVersionHashes(config.gymSubdomain, config.versionHashes);
   const configWithHashes: WodifyPluginConfig = { ...config, versionHashes };
   const membershipId = await discoverMembershipId(configWithHashes);
 

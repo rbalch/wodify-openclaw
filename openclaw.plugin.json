@@ -3,6 +3,14 @@
   "name": "Wodify",
   "description": "Book CrossFit classes on Wodify",
   "version": "0.2.0",
+  "contracts": {
+    "tools": [
+      "wodify_get_classes",
+      "wodify_book_class",
+      "wodify_check_access",
+      "wodify_refresh_config"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
